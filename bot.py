@@ -45,12 +45,13 @@ user_preferences: Dict = {}
 conversation_history: Dict = {}
 user_stats: Dict = {}
 faq_cache: Dict = {}
+signal_updates: Dict = {}
 
 # Rate limiting
 user_last_request: Dict = {}
 RATE_LIMIT_SECONDS = 3
 
-# FAQ Database (instant responses, no AI needed)
+# FAQ Database
 FAQ_RESPONSES = {
     "how to calculate lot size": """
 📊 **Lot Size Calculator**
@@ -177,6 +178,9 @@ class TradingSignal:
         self.current_profit = 0.0
         self.hit_tp = False
         self.hit_sl = False
+        self.partial_profits = []
+        self.breakeven_level = None
+        self.updates_history = []
     
     def to_dict(self):
         return {
@@ -189,7 +193,9 @@ class TradingSignal:
             "status": self.status,
             "current_profit": self.current_profit,
             "hit_tp": self.hit_tp,
-            "hit_sl": self.hit_sl
+            "hit_sl": self.hit_sl,
+            "partial_profits": self.partial_profits,
+            "breakeven_level": self.breakeven_level
         }
 
 
@@ -208,16 +214,12 @@ def should_respond_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Determine if bot should respond in group chat"""
     message = update.message
     
-    # Always respond in private chats
     if message.chat.type == 'private':
         return True
     
-    # In groups, only respond if:
-    # 1. Message is a command
     if message.text and message.text.startswith('/'):
         return True
     
-    # 2. Bot is mentioned
     if message.entities:
         for entity in message.entities:
             if entity.type == 'mention':
@@ -225,7 +227,6 @@ def should_respond_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if mentioned_username == f"@{context.bot.username}":
                     return True
     
-    # 3. Message is a reply to bot
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
         return True
     
@@ -236,12 +237,10 @@ def search_faq(query: str) -> Optional[str]:
     """Search FAQ for instant responses"""
     query_lower = query.lower().strip()
     
-    # Direct keyword matching
     for key, response in FAQ_RESPONSES.items():
         if key in query_lower or query_lower in key:
             return response
     
-    # Fuzzy matching for common variations
     if any(word in query_lower for word in ['lot', 'size', 'calculate', 'position']):
         return FAQ_RESPONSES.get("how to calculate lot size")
     
@@ -260,11 +259,152 @@ def search_faq(query: str) -> Optional[str]:
     return None
 
 
+async def parse_signal_with_ai(message_text: str) -> Optional[TradingSignal]:
+    """Use Claude AI to intelligently parse signals from natural language"""
+    try:
+        prompt = f"""Analyze this trading signal message and extract the trading information.
+        
+Message: {message_text}
+
+Return ONLY valid JSON with this structure (or empty object if no valid signal):
+{{
+    "instrument": "PAIR_NAME",
+    "side": "BUY" or "SELL",
+    "entry": float_value,
+    "tp": float_value,
+    "sl": float_value
+}}
+
+If any required field is missing or unclear, return {{}}.
+"""
+        
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        response_text = response.content[0].text.strip()
+        signal_data = json.loads(response_text)
+        
+        if signal_data and all(k in signal_data for k in ['instrument', 'side', 'entry', 'tp', 'sl']):
+            return TradingSignal(
+                instrument=signal_data['instrument'],
+                side=signal_data['side'],
+                entry=float(signal_data['entry']),
+                tp=float(signal_data['tp']),
+                sl=float(signal_data['sl']),
+                timestamp=datetime.now()
+            )
+    
+    except Exception as e:
+        logger.error(f"AI signal parsing error: {e}")
+    
+    return None
+
+
+async def parse_signal_update(message_text: str, instrument: str) -> Optional[Dict]:
+    """Use Claude AI to understand signal updates (breakeven, take partial profits, etc)"""
+    try:
+        prompt = f"""A trader just sent an update about their {instrument} trade. Understand what they mean.
+
+Update message: {message_text}
+
+Identify what action they're taking. Return ONLY valid JSON:
+{{
+    "action": "breakeven" | "take_partial_profit" | "move_stop_loss" | "move_take_profit" | "close_trade" | "add_position" | "other",
+    "value": float_value_if_applicable,
+    "description": "brief explanation"
+}}
+
+If unclear, return {{"action": "other", "description": "message content"}}.
+"""
+        
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=150,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        response_text = response.content[0].text.strip()
+        update_data = json.loads(response_text)
+        return update_data if update_data else None
+    
+    except Exception as e:
+        logger.error(f"AI update parsing error: {e}")
+        return None
+
+
+async def apply_signal_update(signal: TradingSignal, update: Dict) -> str:
+    """Apply update to signal and return status message"""
+    action = update.get('action', 'other')
+    value = update.get('value')
+    
+    if action == 'breakeven':
+        signal.breakeven_level = signal.entry
+        signal.updates_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "BREAKEVEN SET",
+            "details": f"Stop loss moved to entry at {signal.entry}"
+        })
+        return f"✅ {signal.instrument} - Stop loss moved to breakeven ({signal.entry})"
+    
+    elif action == 'take_partial_profit':
+        signal.partial_profits.append({
+            "level": value,
+            "timestamp": datetime.now().isoformat()
+        })
+        signal.updates_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "PARTIAL PROFIT",
+            "details": f"Partial profit taken at {value}"
+        })
+        return f"🎯 {signal.instrument} - Partial profit taken at {value}!"
+    
+    elif action == 'move_stop_loss':
+        old_sl = signal.sl
+        signal.sl = value
+        signal.updates_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "SL MOVED",
+            "details": f"Stop loss moved from {old_sl} to {value}"
+        })
+        return f"🛡️ {signal.instrument} - Stop loss moved to {value} (was {old_sl})"
+    
+    elif action == 'move_take_profit':
+        old_tp = signal.tp
+        signal.tp = value
+        signal.updates_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "TP MOVED",
+            "details": f"Take profit moved from {old_tp} to {value}"
+        })
+        return f"📈 {signal.instrument} - Take profit moved to {value} (was {old_tp})"
+    
+    elif action == 'close_trade':
+        signal.status = "CLOSED"
+        signal.updates_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "TRADE CLOSED",
+            "details": "Signal closed"
+        })
+        if signal.instrument in active_signals:
+            del active_signals[signal.instrument]
+            closed_signals.append(signal.to_dict())
+        return f"❌ {signal.instrument} - Trade closed!"
+    
+    else:
+        return f"📝 {signal.instrument} - Update received: {update.get('description', 'trade update')}"
+
+
 def determine_ai_complexity(query: str) -> str:
     """Determine which AI to use based on query complexity"""
     query_lower = query.lower()
     
-    # Use GPT-3.5 for simple queries (cheaper)
     simple_keywords = [
         'hi', 'hello', 'thanks', 'thank you', 'ok', 'okay', 
         'yes', 'no', 'good', 'great', 'cool'
@@ -273,11 +413,9 @@ def determine_ai_complexity(query: str) -> str:
     if any(keyword == query_lower.strip() for keyword in simple_keywords):
         return 'gpt-simple'
     
-    # Use GPT-3.5 for basic questions
     if len(query.split()) < 10 and '?' in query:
         return 'gpt-basic'
     
-    # Use Claude for complex analysis
     complex_indicators = [
         'explain', 'analyze', 'why', 'strategy', 'recommend',
         'should i', 'what do you think', 'advice', 'suggestion'
@@ -286,25 +424,21 @@ def determine_ai_complexity(query: str) -> str:
     if any(indicator in query_lower for indicator in complex_indicators):
         return 'claude-complex'
     
-    # Default to GPT for medium complexity
     return 'gpt-basic'
 
 
 async def get_ai_response(user_message: str, user_id: int, complexity: str = 'auto') -> str:
     """Get AI response with smart routing"""
     
-    # Auto-detect complexity if not specified
     if complexity == 'auto':
         complexity = determine_ai_complexity(user_message)
     
-    # Build context
     history = conversation_history.get(user_id, [])
     signal_context = f"Active signals: {len(active_signals)} - {list(active_signals.keys())}" if active_signals else "No active signals"
     
     try:
         if complexity == 'gpt-simple':
-            # Very simple responses with GPT-3.5
-            response = openai.ChatCompletion.create(
+            response = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": "You are a friendly trading assistant. Keep responses very brief and conversational."},
@@ -316,8 +450,7 @@ async def get_ai_response(user_message: str, user_id: int, complexity: str = 'au
             return response.choices[0].message.content
         
         elif complexity == 'gpt-basic':
-            # Basic questions with GPT-3.5
-            response = openai.ChatCompletion.create(
+            response = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": f"You are Trade2Retire AI Assistant. Be helpful and concise. {signal_context}"},
@@ -329,8 +462,7 @@ async def get_ai_response(user_message: str, user_id: int, complexity: str = 'au
             )
             return response.choices[0].message.content
         
-        else:  # claude-complex
-            # Complex analysis with Claude
+        else:
             system_context = f"""You are Trade2Retire AI Assistant, a professional forex trading support bot.
 
 Your expertise:
@@ -341,7 +473,7 @@ Your expertise:
 
 Current context: {signal_context}
 
-Be professional, insightful, and supportive. Provide detailed explanations when needed."""
+Be professional, insightful, and supportive."""
             
             message = anthropic_client.messages.create(
                 model="claude-sonnet-4-20250514",
@@ -368,7 +500,6 @@ async def update_conversation_history(user_id: int, user_msg: str, bot_response:
     conversation_history[user_id].append({"role": "user", "content": user_msg})
     conversation_history[user_id].append({"role": "assistant", "content": bot_response})
     
-    # Keep last 8 messages
     if len(conversation_history[user_id]) > 8:
         conversation_history[user_id] = conversation_history[user_id][-8:]
 
@@ -377,7 +508,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
     
-    # Initialize user stats
     if user.id not in user_stats:
         user_stats[user.id] = {
             "joined": datetime.now(),
@@ -393,6 +523,7 @@ I'm your intelligent 24/7 trading companion powered by advanced AI.
 **What I Can Do:**
 ✅ Answer trading questions instantly
 ✅ Track and analyze signals automatically
+✅ Understand natural language signal updates
 ✅ Calculate risk and position sizes
 ✅ Provide market insights
 ✅ Remember our conversations
@@ -402,16 +533,16 @@ I'm your intelligent 24/7 trading companion powered by advanced AI.
 📱 **In Private Chat:** Just message me anything!
 
 👥 **In Group Chat:** 
-• Mention me: @{context.bot.username}
-• Reply to my messages
-• Use commands: /signals, /help
+- Mention me: @{context.bot.username}
+- Reply to my messages
+- Use commands: /signals, /help
 
 **Quick Start:**
 /signals - View active signals
 /help - See all commands
 /stats - Your trading statistics
 
-💡 **Pro Tip:** I use smart AI routing to respond super fast while managing costs efficiently!
+💡 **Pro Tip:** I use Claude + GPT AI to understand ANY signal format or update!
 
 Ready to elevate your trading? Ask me anything! 🚀
 """
@@ -455,16 +586,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 **💬 Natural Conversation:**
 Just talk to me! Ask questions like:
-• "What's happening with EURUSD?"
-• "Calculate lot size for $500 account"
-• "Explain this week's signals"
-• "Should I enter this trade?"
+- "What's happening with EURUSD?"
+- "Calculate lot size for $500 account"
+- "Explain this week's signals"
+- "Should I enter this trade?"
+
+**🔄 Signal Updates:**
+Post ANY signal format in the channel - I'll understand it!
+- Natural language updates like "breakeven" or "take partial profits"
+- I learn what you mean and update signals accordingly
 
 **Group Chat Usage:**
 To activate me in groups:
-• @mention me: @{context.bot.username}
-• Reply to my messages
-• Use any command
+- @mention me: @{context.bot.username}
+- Reply to my messages
+- Use any command
 
 **Need Help?** Just ask! I'm designed to understand natural language. 🤖✨
 """
@@ -492,7 +628,6 @@ async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "📊 **ACTIVE TRADING SIGNALS**\n" + "="*30 + "\n\n"
     
     for instrument, signal in active_signals.items():
-        # Calculate potential profit
         pip_difference = abs(signal.tp - signal.entry)
         
         if signal.current_profit > 0:
@@ -510,6 +645,13 @@ async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"├─ Entry: `{signal.entry}`\n"
         message += f"├─ Take Profit: `{signal.tp}`\n"
         message += f"├─ Stop Loss: `{signal.sl}`\n"
+        
+        if signal.breakeven_level:
+            message += f"├─ Breakeven: ✅\n"
+        
+        if signal.partial_profits:
+            message += f"├─ Partial Profits: {len(signal.partial_profits)}\n"
+        
         message += f"├─ Status: {status_text}\n"
         message += f"└─ Posted: {signal.timestamp.strftime('%b %d, %H:%M')}\n\n"
     
@@ -564,39 +706,31 @@ Signals Tracked: {len(active_signals) + len(closed_signals)}
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages with smart AI routing"""
     
-    # Check if should respond in group
     if not should_respond_in_group(update, context):
         return
     
     user_id = update.effective_user.id
     user_message = update.message.text
     
-    # Remove bot mention if present
     if context.bot.username:
         user_message = user_message.replace(f"@{context.bot.username}", "").strip()
     
-    # Rate limiting
     if not check_rate_limit(user_id):
         await update.message.reply_text("⏳ Please wait a moment before sending another message!")
         return
     
-    # Update stats
     if user_id in user_stats:
         user_stats[user_id]['queries'] += 1
     
-    # Check FAQ first (instant, free response)
     faq_response = search_faq(user_message)
     if faq_response:
         await update.message.reply_text(faq_response)
         return
     
-    # Show typing indicator
     await update.message.chat.send_action(action="typing")
     
-    # Get AI response with smart routing
     response = await get_ai_response(user_message, user_id)
     
-    # Update conversation history
     await update_conversation_history(user_id, user_message, response)
     
     await update.message.reply_text(response)
@@ -645,11 +779,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2️⃣ Ask questions in natural language
 3️⃣ Get instant FAQ responses
 4️⃣ Receive AI-powered analysis
+5️⃣ Post signals ANY way - I'll understand!
 
 **In Groups:**
-• Mention: @{} [your question]
-• Reply to my messages
-• Use commands like /signals
+- Mention: @{} [your question]
+- Reply to my messages
+- Use commands like /signals
 
 **Popular Commands:**
 /signals - Active signals
@@ -661,6 +796,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✨ I respond instantly to common questions
 ✨ Complex questions get deep AI analysis
 ✨ I remember our conversation context
+✨ I understand natural language signal updates
 ✨ Set alerts with /alerts
 
 Start by asking me anything! 🚀
@@ -677,19 +813,28 @@ Start by asking me anything! 🚀
 ✅ Ask about signal rationale
 ✅ Request risk calculations
 ✅ Learn trading concepts
+✅ Post signals ANY format - natural or structured
 
 **Example Questions:**
-• "Analyze the GBPUSD signal"
-• "Calculate lot size for $1000, 2% risk"
-• "Why was EURUSD signal given?"
-• "What's the status of today's trades?"
+- "Analyze the GBPUSD signal"
+- "Calculate lot size for $1000, 2% risk"
+- "Why was EURUSD signal given?"
+- "What's the status of today's trades?"
+
+**Signal Updates I Understand:**
+- "move to breakeven"
+- "take partial profit at 1.2500"
+- "close the trade"
+- "move stop loss to 1.1900"
+- Just comment naturally - I'll get it!
 
 **Features:**
-🤖 Smart AI routing (fast + efficient)
+🤖 Claude + GPT AI routing
 💬 Natural conversation
 📊 Automatic signal tracking
 📚 Instant FAQ responses
 🎯 Personalized experience
+🧠 Intelligent signal parsing
 
 **Need help?** Just ask naturally! 
 I understand context and remember our chat. 😊
@@ -728,75 +873,28 @@ Keep following the signals! 🚀
         await query.edit_message_text(perf_message)
 
 
-async def parse_signal_from_channel(message_text: str) -> Optional[TradingSignal]:
-    """Parse trading signal from channel message"""
-    try:
-        lines = [line.strip() for line in message_text.split('\n') if line.strip()]
-        
-        signal_data = {}
-        instrument = None
-        
-        for line in lines:
-            line_upper = line.upper()
-            
-            # Detect instrument (currency pair)
-            pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 
-                    'EURNZD', 'EURAUD', 'GBPAUD', 'CHFJPY', 'NZDJPY', 'GBPNZD']
-            for pair in pairs:
-                if pair in line_upper.replace('.', '').replace(' ', ''):
-                    instrument = pair
-                    break
-            
-            # Detect BUY/SELL
-            if 'BUY' in line_upper and 'SELL' not in line_upper:
-                signal_data['side'] = 'BUY'
-            elif 'SELL' in line_upper:
-                signal_data['side'] = 'SELL'
-            
-            # Extract numeric values
-            if 'ENTRY' in line_upper or 'MARKET' in line_upper:
-                nums = re.findall(r'\d+\.\d+', line)
-                if nums:
-                    signal_data['entry'] = float(nums[0])
-            
-            if 'TAKE PROFIT' in line_upper or 'TP' in line_upper:
-                nums = re.findall(r'\d+\.\d+', line)
-                if nums:
-                    signal_data['tp'] = float(nums[-1])
-            
-            if 'STOP LOSS' in line_upper or 'SL' in line_upper:
-                nums = re.findall(r'\d+\.\d+', line)
-                if nums:
-                    signal_data['sl'] = float(nums[-1])
-        
-        # Validate we have all required data
-        if instrument and all(k in signal_data for k in ['side', 'entry', 'tp', 'sl']):
-            return TradingSignal(
-                instrument=instrument,
-                side=signal_data['side'],
-                entry=signal_data['entry'],
-                tp=signal_data['tp'],
-                sl=signal_data['sl'],
-                timestamp=datetime.now()
-            )
-        
-    except Exception as e:
-        logger.error(f"Signal parsing error: {e}")
-    
-    return None
-
-
 async def monitor_signal_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Monitor and parse signals from channel"""
+    """Monitor and parse signals from channel using AI"""
     if update.channel_post and update.channel_post.chat_id == SIGNAL_CHANNEL_ID:
         message_text = update.channel_post.text
         
         if message_text:
-            signal = await parse_signal_from_channel(message_text)
+            # Try AI parsing first
+            signal = await parse_signal_with_ai(message_text)
             
             if signal:
                 active_signals[signal.instrument] = signal
-                logger.info(f"✅ New signal tracked: {signal.instrument} {signal.side}")
+                logger.info(f"✅ New signal tracked (AI parsed): {signal.instrument} {signal.side}")
+            else:
+                # Check if it's an update to an existing signal
+                for instrument in list(active_signals.keys()):
+                    if instrument.lower() in message_text.lower():
+                        update = await parse_signal_update(message_text, instrument)
+                        if update and update.get('action') != 'other':
+                            signal = active_signals[instrument]
+                            status = await apply_signal_update(signal, update)
+                            logger.info(f"✅ Signal updated: {status}")
+                            break
 
 
 def main():
@@ -820,12 +918,12 @@ def main():
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, monitor_signal_channel))
     
     # Start
-    logger.info("🚀 Trade2Retire AI Assistant - PRODUCTION VERSION")
-    logger.info("✅ Smart group activation enabled")
-    logger.info("✅ Hybrid AI system active (GPT-3.5 + Claude)")
-    logger.info("✅ FAQ caching enabled")
-    logger.info("✅ Rate limiting enabled")
-    logger.info("✅ Channel monitoring active")
+    logger.info("🚀 Trade2Retire AI Assistant - ADVANCED VERSION")
+    logger.info("✅ AI-Powered Signal Parsing Active (Claude)")
+    logger.info("✅ Natural Language Update Recognition Enabled")
+    logger.info("✅ Hybrid AI System (Claude + GPT-3.5)")
+    logger.info("✅ Smart Group Activation Enabled")
+    logger.info("✅ Channel Monitoring Active")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
