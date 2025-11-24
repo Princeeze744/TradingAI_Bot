@@ -212,6 +212,9 @@ def check_rate_limit(user_id: int) -> bool:
 
 def should_respond_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Determine if bot should respond in group chat"""
+    if not update.message:
+        return False
+        
     message = update.message
     
     if message.chat.type == 'private':
@@ -259,50 +262,67 @@ def search_faq(query: str) -> Optional[str]:
     return None
 
 
-async def parse_signal_with_ai(message_text: str) -> Optional[TradingSignal]:
-    """Use Claude AI to intelligently parse signals from natural language"""
+async def intelligent_signal_parser(message_text: str) -> Optional[TradingSignal]:
+    """Ultra-intelligent signal parser using Claude - understands ANY format"""
     try:
-        prompt = f"""Analyze this trading signal message and extract the trading information.
-        
+        prompt = f"""You are an expert forex signal parser. Extract trading signal from this message.
+
 Message: {message_text}
 
-Return ONLY valid JSON with this structure (or empty object if no valid signal):
+RULES:
+- Look for ANY pair/symbol: EURUSD, GBPUSD, DEX900, USDCAD, GBPAUD, EURNZD, etc
+- If no pair mentioned, infer from context or use first uppercase word
+- BUY/SELL can be: buy, sell, long, short, bullish, bearish, etc
+- Find 3 numbers: entry price, take profit, stop loss
+- Order doesn't matter - find all numbers
+
+Return ONLY this JSON (no markdown, no code blocks, just raw JSON):
 {{
-    "instrument": "PAIR_NAME",
-    "side": "BUY" or "SELL",
-    "entry": float_value,
-    "tp": float_value,
-    "sl": float_value
+    "instrument": "DETECTED_PAIR",
+    "side": "BUY or SELL",
+    "entry": first_number,
+    "tp": second_number,
+    "sl": third_number
 }}
 
-If any required field is missing or unclear, return {{}}.
-"""
+CRITICAL: Return ONLY raw JSON. NO ```json markdown blocks. NO extra text."""
         
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=200,
+            max_tokens=300,
             messages=[
                 {"role": "user", "content": prompt}
             ]
         )
         
         response_text = response.content[0].text.strip()
+        logger.info(f"🤖 AI Raw Response: {response_text}")
+        
+        # Strip markdown code blocks if present
+        response_text = response_text.replace('```json', '').replace('```', '').strip()
+        logger.info(f"🤖 AI Cleaned Response: {response_text}")
+        
         signal_data = json.loads(response_text)
         
         if signal_data and all(k in signal_data for k in ['instrument', 'side', 'entry', 'tp', 'sl']):
             return TradingSignal(
-                instrument=signal_data['instrument'],
-                side=signal_data['side'],
+                instrument=str(signal_data['instrument']).upper(),
+                side=str(signal_data['side']).upper(),
                 entry=float(signal_data['entry']),
                 tp=float(signal_data['tp']),
                 sl=float(signal_data['sl']),
                 timestamp=datetime.now()
             )
+        else:
+            logger.warning(f"⚠️ AI could not extract valid signal data: {signal_data}")
+            return None
     
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON Parse Error: {e}")
+        return None
     except Exception as e:
-        logger.error(f"AI signal parsing error: {e}")
-    
-    return None
+        logger.error(f"Signal parsing error: {e}")
+        return None
 
 
 async def parse_signal_update(message_text: str, instrument: str) -> Optional[Dict]:
@@ -315,12 +335,13 @@ Update message: {message_text}
 Identify what action they're taking. Return ONLY valid JSON:
 {{
     "action": "breakeven" | "take_partial_profit" | "move_stop_loss" | "move_take_profit" | "close_trade" | "add_position" | "other",
-    "value": float_value_if_applicable,
+    "value": number_if_applicable,
     "description": "brief explanation"
 }}
 
 If unclear, return {{"action": "other", "description": "message content"}}.
-"""
+
+Return ONLY raw JSON, no markdown blocks."""
         
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -331,6 +352,7 @@ If unclear, return {{"action": "other", "description": "message content"}}.
         )
         
         response_text = response.content[0].text.strip()
+        response_text = response_text.replace('```json', '').replace('```', '').strip()
         update_data = json.loads(response_text)
         return update_data if update_data else None
     
@@ -523,6 +545,7 @@ I'm your intelligent 24/7 trading companion powered by advanced AI.
 **What I Can Do:**
 ✅ Answer trading questions instantly
 ✅ Track and analyze signals automatically
+✅ Understand ANY signal format or style
 ✅ Understand natural language signal updates
 ✅ Calculate risk and position sizes
 ✅ Provide market insights
@@ -542,7 +565,7 @@ I'm your intelligent 24/7 trading companion powered by advanced AI.
 /help - See all commands
 /stats - Your trading statistics
 
-💡 **Pro Tip:** I use Claude + GPT AI to understand ANY signal format or update!
+💡 **Pro Tip:** I use Claude AI to understand ANY way you write signals or updates!
 
 Ready to elevate your trading? Ask me anything! 🚀
 """
@@ -593,6 +616,9 @@ Just talk to me! Ask questions like:
 
 **🔄 Signal Updates:**
 Post ANY signal format in the channel - I'll understand it!
+- "buy dex900 up sl 3031 tp 3173"
+- "BUY EURUSD Entry 1.1000 TP 1.1100 SL 1.0950"
+- "buy limit on GBPAUD Entry price 2.01 profit 2.03 stop 2.00"
 - Natural language updates like "breakeven" or "take partial profits"
 - I learn what you mean and update signals accordingly
 
@@ -706,7 +732,7 @@ Signals Tracked: {len(active_signals) + len(closed_signals)}
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages with smart AI routing"""
     
-    if not should_respond_in_group(update, context):
+    if not update.message or not update.message.text:
         return
     
     user_id = update.effective_user.id
@@ -719,6 +745,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Please wait a moment before sending another message!")
         return
     
+    # For private chats, try to parse as signal first
+    if update.message.chat.type == 'private':
+        signal = await intelligent_signal_parser(user_message)
+        if signal:
+            active_signals[signal.instrument] = signal
+            await update.message.reply_text(f"✅ Signal Parsed!\n\n{signal.instrument} {signal.side}\nEntry: {signal.entry}\nTP: {signal.tp}\nSL: {signal.sl}")
+            return
+    
+    if not should_respond_in_group(update, context):
+        return
+    
     if user_id in user_stats:
         user_stats[user_id]['queries'] += 1
     
@@ -727,7 +764,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(faq_response)
         return
     
-    await update.message.chat.send_action(action="typing")
+    try:
+        await update.message.chat.send_action(action="typing")
+    except:
+        pass
     
     response = await get_ai_response(user_message, user_id)
     
@@ -796,7 +836,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✨ I respond instantly to common questions
 ✨ Complex questions get deep AI analysis
 ✨ I remember our conversation context
-✨ I understand natural language signal updates
+✨ I understand ANY signal format
 ✨ Set alerts with /alerts
 
 Start by asking me anything! 🚀
@@ -813,7 +853,14 @@ Start by asking me anything! 🚀
 ✅ Ask about signal rationale
 ✅ Request risk calculations
 ✅ Learn trading concepts
-✅ Post signals ANY format - natural or structured
+✅ Post signals ANY format - I'll understand!
+
+**Example Signal Formats (ALL work):**
+- "buy dex900 up sl 3031 tp 3173"
+- "BUY EURUSD Entry 1.1000 TP 1.1100 SL 1.0950"
+- "buy limit on GBPAUD Entry price 2.01 profit 2.03 stop 2.00"
+- "Entry price 1.41067 profit price 1.41384 stop loss price 1.40967"
+- Literally ANY way you write it!
 
 **Example Questions:**
 - "Analyze the GBPUSD signal"
@@ -826,15 +873,15 @@ Start by asking me anything! 🚀
 - "take partial profit at 1.2500"
 - "close the trade"
 - "move stop loss to 1.1900"
-- Just comment naturally - I'll get it!
+- Any natural language update!
 
 **Features:**
-🤖 Claude + GPT AI routing
+🤖 Claude AI (understands ANYTHING)
 💬 Natural conversation
 📊 Automatic signal tracking
 📚 Instant FAQ responses
 🎯 Personalized experience
-🧠 Intelligent signal parsing
+🧠 Intelligent flexible parsing
 
 **Need help?** Just ask naturally! 
 I understand context and remember our chat. 😊
@@ -874,27 +921,52 @@ Keep following the signals! 🚀
 
 
 async def monitor_signal_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Monitor and parse signals from channel using AI"""
-    if update.channel_post and update.channel_post.chat_id == SIGNAL_CHANNEL_ID:
-        message_text = update.channel_post.text
+    """Monitor and parse signals from channel using ultra-intelligent AI parser"""
+    
+    if update.channel_post:
+        chat_id = update.channel_post.chat_id
+        logger.info(f"📢 Channel post received from chat_id: {chat_id} (Expected: {SIGNAL_CHANNEL_ID})")
         
-        if message_text:
-            # Try AI parsing first
-            signal = await parse_signal_with_ai(message_text)
+        if chat_id == SIGNAL_CHANNEL_ID:
+            message_text = update.channel_post.text
             
-            if signal:
-                active_signals[signal.instrument] = signal
-                logger.info(f"✅ New signal tracked (AI parsed): {signal.instrument} {signal.side}")
-            else:
-                # Check if it's an update to an existing signal
-                for instrument in list(active_signals.keys()):
-                    if instrument.lower() in message_text.lower():
-                        update = await parse_signal_update(message_text, instrument)
-                        if update and update.get('action') != 'other':
-                            signal = active_signals[instrument]
-                            status = await apply_signal_update(signal, update)
-                            logger.info(f"✅ Signal updated: {status}")
-                            break
+            if message_text:
+                logger.info(f"📝 Parsing message: {message_text[:100]}")
+                
+                # Try ultra-intelligent AI parsing
+                signal = await intelligent_signal_parser(message_text)
+                
+                if signal:
+                    # Check if signal for this instrument already exists
+                    if signal.instrument in active_signals:
+                        logger.info(f"⚠️ Signal for {signal.instrument} already exists, checking if it's an update...")
+                        update_data = await parse_signal_update(message_text, signal.instrument)
+                        if update_data and update_data.get('action') != 'other':
+                            existing_signal = active_signals[signal.instrument]
+                            status = await apply_signal_update(existing_signal, update_data)
+                            logger.info(f"✅ {status}")
+                    else:
+                        # New signal
+                        active_signals[signal.instrument] = signal
+                        logger.info(f"✅✅✅ NEW SIGNAL PARSED ✅✅✅")
+                        logger.info(f"Instrument: {signal.instrument}")
+                        logger.info(f"Side: {signal.side}")
+                        logger.info(f"Entry: {signal.entry}")
+                        logger.info(f"TP: {signal.tp}")
+                        logger.info(f"SL: {signal.sl}")
+                else:
+                    logger.warning(f"⚠️ Could not parse signal from message")
+                    
+                    # Check if it's an update to any existing signal
+                    for instrument in list(active_signals.keys()):
+                        if instrument.lower() in message_text.lower():
+                            logger.info(f"🔄 Checking if message is an update to {instrument}")
+                            update_data = await parse_signal_update(message_text, instrument)
+                            if update_data and update_data.get('action') != 'other':
+                                existing_signal = active_signals[instrument]
+                                status = await apply_signal_update(existing_signal, update_data)
+                                logger.info(f"✅ {status}")
+                                break
 
 
 def main():
@@ -914,16 +986,20 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     
-    # Channel monitoring for signals
+    # Channel monitoring for signals - MUST be before group messages
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, monitor_signal_channel))
     
     # Start
-    logger.info("🚀 Trade2Retire AI Assistant - ADVANCED VERSION")
-    logger.info("✅ AI-Powered Signal Parsing Active (Claude)")
-    logger.info("✅ Natural Language Update Recognition Enabled")
-    logger.info("✅ Hybrid AI System (Claude + GPT-3.5)")
-    logger.info("✅ Smart Group Activation Enabled")
-    logger.info("✅ Channel Monitoring Active")
+    logger.info("="*60)
+    logger.info("🚀 Trade2Retire AI Assistant - ULTRA-INTELLIGENT VERSION")
+    logger.info("="*60)
+    logger.info("✅ Claude AI - Ultra-Flexible Signal Parsing")
+    logger.info("✅ Understands ANY signal format")
+    logger.info("✅ Natural language updates (breakeven, partial profits, etc)")
+    logger.info("✅ Smart group activation")
+    logger.info("✅ Channel monitoring active")
+    logger.info("✅ Hybrid AI system (Claude + GPT-3.5)")
+    logger.info("="*60)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
