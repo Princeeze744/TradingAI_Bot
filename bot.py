@@ -270,22 +270,23 @@ async def intelligent_signal_parser(message_text: str) -> Optional[TradingSignal
 Message: {message_text}
 
 RULES:
-- Look for ANY pair/symbol: EURUSD, GBPUSD, DEX900, USDCAD, GBPAUD, EURNZD, etc
-- If no pair mentioned, infer from context or use first uppercase word
-- BUY/SELL can be: buy, sell, long, short, bullish, bearish, etc
+- Look for ANY pair/symbol: EURUSD, GBPUSD, EURGBP, DEX900, USDCAD, GBPAUD, EURNZD, etc
+- If no pair mentioned, infer from context or use first uppercase words
+- BUY/SELL can be: buy, sell, long, short, bullish, bearish, limit, etc
 - Find 3 numbers: entry price, take profit, stop loss
 - Order doesn't matter - find all numbers
+- Labels like "entry at", "sl at", "tp at" help identify the numbers
 
 Return ONLY this JSON (no markdown, no code blocks, just raw JSON):
 {{
     "instrument": "DETECTED_PAIR",
     "side": "BUY or SELL",
-    "entry": first_number,
-    "tp": second_number,
-    "sl": third_number
+    "entry": number,
+    "tp": number,
+    "sl": number
 }}
 
-CRITICAL: Return ONLY raw JSON. NO ```json markdown blocks. NO extra text."""
+CRITICAL: Return ONLY raw JSON. NO ```json markdown. NO extra text. All fields required."""
         
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -296,26 +297,27 @@ CRITICAL: Return ONLY raw JSON. NO ```json markdown blocks. NO extra text."""
         )
         
         response_text = response.content[0].text.strip()
-        logger.info(f"🤖 AI Raw Response: {response_text}")
+        logger.info(f"🤖 AI Raw Response: {response_text[:150]}")
         
         # Strip markdown code blocks if present
         response_text = response_text.replace('```json', '').replace('```', '').strip()
-        logger.info(f"🤖 AI Cleaned Response: {response_text}")
         
         signal_data = json.loads(response_text)
+        logger.info(f"🤖 Parsed JSON: {signal_data}")
         
         if signal_data and all(k in signal_data for k in ['instrument', 'side', 'entry', 'tp', 'sl']):
-            return TradingSignal(
-                instrument=str(signal_data['instrument']).upper(),
-                side=str(signal_data['side']).upper(),
-                entry=float(signal_data['entry']),
-                tp=float(signal_data['tp']),
-                sl=float(signal_data['sl']),
-                timestamp=datetime.now()
-            )
-        else:
-            logger.warning(f"⚠️ AI could not extract valid signal data: {signal_data}")
-            return None
+            if signal_data['entry'] and signal_data['tp'] and signal_data['sl']:
+                return TradingSignal(
+                    instrument=str(signal_data['instrument']).upper(),
+                    side=str(signal_data['side']).upper(),
+                    entry=float(signal_data['entry']),
+                    tp=float(signal_data['tp']),
+                    sl=float(signal_data['sl']),
+                    timestamp=datetime.now()
+                )
+        
+        logger.warning(f"⚠️ AI could not extract valid signal data or missing fields: {signal_data}")
+        return None
     
     except json.JSONDecodeError as e:
         logger.error(f"JSON Parse Error: {e}")
@@ -619,6 +621,7 @@ Post ANY signal format in the channel - I'll understand it!
 - "buy dex900 up sl 3031 tp 3173"
 - "BUY EURUSD Entry 1.1000 TP 1.1100 SL 1.0950"
 - "buy limit on GBPAUD Entry price 2.01 profit 2.03 stop 2.00"
+- "buy limit on eurgbp entry at 0.88003 sl at 0.87920 tp at 0.88343"
 - Natural language updates like "breakeven" or "take partial profits"
 - I learn what you mean and update signals accordingly
 
@@ -859,6 +862,7 @@ Start by asking me anything! 🚀
 - "buy dex900 up sl 3031 tp 3173"
 - "BUY EURUSD Entry 1.1000 TP 1.1100 SL 1.0950"
 - "buy limit on GBPAUD Entry price 2.01 profit 2.03 stop 2.00"
+- "buy limit on eurgbp entry at 0.88003 sl at 0.87920 tp at 0.88343"
 - "Entry price 1.41067 profit price 1.41384 stop loss price 1.40967"
 - Literally ANY way you write it!
 
@@ -929,6 +933,7 @@ async def monitor_signal_channel(update: Update, context: ContextTypes.DEFAULT_T
         
         if chat_id == SIGNAL_CHANNEL_ID:
             message_text = update.channel_post.text
+            logger.info(f"📝 Message text: {message_text}")
             
             if message_text:
                 logger.info(f"📝 Parsing message: {message_text[:100]}")
@@ -937,6 +942,10 @@ async def monitor_signal_channel(update: Update, context: ContextTypes.DEFAULT_T
                 signal = await intelligent_signal_parser(message_text)
                 
                 if signal:
+                    logger.info(f"✅✅✅ SIGNAL PARSED SUCCESSFULLY ✅✅✅")
+                    logger.info(f"Instrument: {signal.instrument}, Side: {signal.side}")
+                    logger.info(f"Entry: {signal.entry}, TP: {signal.tp}, SL: {signal.sl}")
+                    
                     # Check if signal for this instrument already exists
                     if signal.instrument in active_signals:
                         logger.info(f"⚠️ Signal for {signal.instrument} already exists, checking if it's an update...")
@@ -948,14 +957,9 @@ async def monitor_signal_channel(update: Update, context: ContextTypes.DEFAULT_T
                     else:
                         # New signal
                         active_signals[signal.instrument] = signal
-                        logger.info(f"✅✅✅ NEW SIGNAL PARSED ✅✅✅")
-                        logger.info(f"Instrument: {signal.instrument}")
-                        logger.info(f"Side: {signal.side}")
-                        logger.info(f"Entry: {signal.entry}")
-                        logger.info(f"TP: {signal.tp}")
-                        logger.info(f"SL: {signal.sl}")
+                        logger.info(f"✅✅✅ NEW SIGNAL TRACKED ✅✅✅")
                 else:
-                    logger.warning(f"⚠️ Could not parse signal from message")
+                    logger.warning(f"⚠️ Could not parse signal from message: {message_text}")
                     
                     # Check if it's an update to any existing signal
                     for instrument in list(active_signals.keys()):
@@ -967,6 +971,8 @@ async def monitor_signal_channel(update: Update, context: ContextTypes.DEFAULT_T
                                 status = await apply_signal_update(existing_signal, update_data)
                                 logger.info(f"✅ {status}")
                                 break
+            else:
+                logger.warning("⚠️ No text in channel post")
 
 
 def main():
